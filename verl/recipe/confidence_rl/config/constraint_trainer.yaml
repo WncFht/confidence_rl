@@ -1,0 +1,44 @@
+hydra:
+  searchpath:
+    - file://verl/verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+data:
+  gen_batch_size: ${data.train_batch_size}
+
+reward_model:
+  reward_manager: dapo
+  overlong_buffer: 
+    enable: False # We try to avoid forgetting to set enable
+    len: 0
+    penalty_factor: 0.0
+    log: False
+
+algorithm:
+  filter_groups:
+    _target_: verl.trainer.config.FilterGroupsConfig
+    enable: False # We try to avoid forgetting to set enable
+    metric: null # acc / score / seq_reward / seq_final_reward / ...
+    max_num_gen_batches: 0 # Non-positive values mean no upper limit
+  
+  # Constraint configuration for Constrained DAPO
+  use_constraints: False  # Enable Lagrangian constraint optimization
+  
+  constraint_config:
+    # Target length configuration
+    target_brier_score: 0.5  # Target average response length
+    
+    # Lagrange multiplier settings
+    lambda_init: 0.01   # Initial value of Lagrange multiplier
+    lambda_lr: 0.02     # Learning rate for lambda updates
+    lambda_max: 2.0     # Maximum value for lambda (matches reward scale [-1, 1])
+    lambda_min: 0.0     # Minimum value for lambda
+    
+    # Constraint type
+    constraint_type: "average"  # "average" or "max" - which metric to constrain
+
+trainer:
+  project_name: verl-constrain
