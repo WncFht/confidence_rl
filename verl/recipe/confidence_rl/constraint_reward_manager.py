@@ -26,7 +26,7 @@ class CalashRewardManager:
     
     def __init__(
         self,
-        target_brier_score: float = 0.1,  # Target for the average Brier score (e.g., 0.1)
+        target_brier_score: float = 0.25,  # Target for the average Brier score (e.g., 0.1)
         lambda_init: float = 0.1,
         lambda_lr: float = 0.01,
         lambda_max: float = 5.0,  # Max penalty coefficient
@@ -45,7 +45,7 @@ class CalashRewardManager:
         # Lagrange multiplier
         self.lagrange_multiplier = lambda_init
         
-        # Tracking statistics
+        # Tracking statistics (keys here MUST match get_metrics)
         self.stats = {
             "avg_brier": [],
             "max_brier": [],
@@ -53,12 +53,12 @@ class CalashRewardManager:
             "std_brier": [],
             "avg_confidence": [],
             "std_confidence": [],
-            "avg_task_reward": [], # Tracks original task reward
+            "avg_task_reward": [], # Tracks original task reward of valid samples
             "constraint_violation": [],
             "lagrange_multiplier": [],
-            "num_violations": [], # Fraction of samples exceeding target Brier
-            "penalty_magnitude": [], # Average penalty applied per sample
-            "satisfaction_rate": [], # Fraction of samples <= target Brier
+            "num_violations": [], # Fraction of valid samples exceeding target Brier
+            "penalty_magnitude": [], # Average penalty applied per valid sample
+            "satisfaction_rate": [], # Fraction of valid samples <= target Brier
             "penalty_active_rate": [],
             "avg_active_penalty": [],
             "lambda_change_rate": [],
@@ -67,7 +67,8 @@ class CalashRewardManager:
     def compute_constrained_reward(
         self, 
         batch: DataProto,
-        return_dict: bool = True
+        return_dict: bool = True,
+        FORMAT_PENALTY: float = -2.0,
     ) -> Union[torch.Tensor, Dict[str, Union[torch.Tensor, Dict]]]:
         """
         Apply Lagrangian constraint (CALASH) to rewards based on Brier Score.
@@ -81,134 +82,153 @@ class CalashRewardManager:
         - Batch Violation: $g = \mathbb{E}[B_i] - L_{Brier}$
         - Lambda update: $\lambda = \text{clip}(\lambda + \eta_\lambda \cdot g, \lambda_{min}, \lambda_{max})$
         """
-        # 1. Get rewards
+        # 1. Get rewards and masks
         rewards = batch.batch["token_level_scores"]
+        response_mask = batch.batch["response_mask"]
+        confidence_tensor = batch.batch["confidence_tensor"] # Shape: (batch_size,)
 
         # Clone to avoid in-place modification
         reward_tensor = rewards.clone()
         
-        # 2. Get response masks and confidence
-        if "response_mask" not in batch.batch:
-            raise ValueError("response_mask not found in batch.")
-        if "confidence_tensor" not in batch.batch:
-            raise ValueError("CALASH requires 'confidence_tensor' (shape [batch_size]) in batch.")
-        
-        response_mask = batch.batch["response_mask"]
-        confidence_tensor = batch.batch["confidence_tensor"] # Shape: (batch_size,)
-        
-        if confidence_tensor.shape != (reward_tensor.shape[0],):
-             raise ValueError(f"Confidence tensor shape mismatch. Expected {(reward_tensor.shape[0],)}, got {confidence_tensor.shape}")
-
         # 3. Loop through samples to compute Brier score and apply penalty
-        brier_scores = []
-        sample_violations = []
-        original_task_rewards = []
+        valid_brier_scores = []
+        valid_sample_violations = [] # Stores *positive* violations
+        valid_original_task_rewards = []
+        valid_confidences = []
         num_violations = 0
         total_penalty = 0.0
           
         for i in range(len(reward_tensor)):
-            # Find actual response length
-            valid_response_length = torch.sum(response_mask[i]).item()
+            valid_response_length = int(torch.sum(response_mask[i]).item())
+        
+            # Skip samples with no response
             if valid_response_length == 0:
-                continue # Skip empty responses
+                continue
+                
+            last_token_idx = valid_response_length - 1
+            r_task = rewards[i, last_token_idx].item()
 
-            # Get task correctness 'y'
-            r_task = rewards[i, valid_response_length - 1].item()
-            original_task_rewards.append(r_task)
-            y_i = 1.0 if r_task > 0 else 0.0
-            
-            # Get model confidence 'c'
-            c_i = confidence_tensor[i].item()
-            
-            # Compute Brier Score: (c - y)^2
-            brier_i = (c_i - y_i) ** 2
-            brier_scores.append(brier_i)
-            
-            # Compute one-sided sample violation
-            violation_i = brier_i - self.target_brier_score
-            sample_violations.append(violation_i)
-            
-            if violation_i > 0:  # Brier score is worse (higher) than target
-                num_violations += 1
-            
-            # Apply one-sided penalty at the last token of the response
-            # Formula: $\tilde{r}_T = r_T - \lambda \cdot \max(0, v_i)$
-            penalty = max(0, self.lagrange_multiplier * violation_i)
-            reward_tensor[i, valid_response_length - 1] -= penalty
-            total_penalty += penalty
+            # Check if the format is correct (i.e., not a format penalty)
+            if r_task != FORMAT_PENALTY:
+                # --- 3a. Format is correct: Apply CALASH logic ---
                 
-        # 4. Clip reward tensor to prevent extreme values
-        reward_tensor = torch.clamp(reward_tensor, min=-1.0, max=1.0)
+                # Get task reward and confidence
+                c_i = confidence_tensor[i].item()
+                y_i = 1.0 if r_task > 0 else 0.0
                 
-        # 5. Compute batch-level statistics for lambda update
-        num_samples = len(brier_scores)
-        avg_brier = np.mean(brier_scores)
-        avg_confidence = confidence_tensor.mean().item()
-        avg_task_reward = np.mean(original_task_rewards)
+                # Statistics for valid samples
+                valid_original_task_rewards.append(r_task)
+                valid_confidences.append(c_i)
+
+                # Calculate Brier Score and CALASH penalty
+                brier_i = (c_i - y_i) ** 2
+                violation_i = brier_i - self.target_brier_score
+                
+                valid_brier_scores.append(brier_i) # Add all valid brier scores
+
+                if violation_i > 0:
+                    num_violations += 1
+                    valid_sample_violations.append(violation_i)
+                    penalty = self.lagrange_multiplier * violation_i
+                else:
+                    penalty = 0.0
+                
+                # Apply penalty and clamp
+                final_reward = r_task - penalty
+                reward_tensor[i, last_token_idx] = torch.clamp(
+                    torch.tensor(final_reward), min=-1.0, max=1.0
+                )
+                total_penalty += penalty
+
+            else:
+                # --- 3b. Format is incorrect ---
+                # The reward is already FORMAT_PENALTY in the original `rewards`
+                # and thus in `reward_tensor`. No action needed, but we
+                # explicitly *don't* include it in Brier score stats.
+                pass
+                
+        # --- 5. Calculate batch statistics (based *only* on valid samples) ---
+        num_total_samples = len(reward_tensor)
+        num_valid_samples = len(valid_brier_scores)
+
+        # Average Brier (only on valid samples) - Used for Lambda update
+        avg_valid_brier = np.mean(valid_brier_scores) if valid_brier_scores else 0.0
         
-        # Compute constraint violation for lambda update
+        # Average confidence and task rewards (only on valid samples) - Used for logging
+        avg_valid_confidence = np.mean(valid_confidences) if valid_confidences else 0.0
+        avg_valid_original_task_reward = np.mean(valid_original_task_rewards) if valid_original_task_rewards else 0.0
+        
         # $g = \mathbb{E}[B_i] - L_{Brier}$
-        current_constraint_violation = avg_brier - self.target_brier_score
-        
+        current_constraint_violation = avg_valid_brier - self.target_brier_score
             
-        # 6. Update Lagrange multiplier
-        # Formula: $\lambda^{(t+1)} = \text{clip}(\lambda^{(t)} + \eta_\lambda \cdot g^{(t)}, \lambda_{min}, \lambda_{max})$
-        self.lagrange_multiplier += self.lambda_lr * current_constraint_violation
-            
-        # Clip lambda to valid range
+        # --- 6. Update Lambda ---
+        # We update lambda even if num_valid_samples is 0.
+        # In that case, avg_valid_brier is 0, and the violation will be
+        # -self.target_brier_score, causing lambda to decrease (which is reasonable).
+        lambda_change = self.lambda_lr * current_constraint_violation
+        self.lagrange_multiplier += lambda_change
         self.lagrange_multiplier = np.clip(
             self.lagrange_multiplier, self.lambda_min, self.lambda_max
         )
 
-        # 7. Update statistics
-        if num_samples > 0:
-            self.stats["avg_brier"].append(avg_brier)
-            self.stats["std_brier"].append(np.std(brier_scores))
-            self.stats["max_brier"].append(np.max(brier_scores))
-            self.stats["min_brier"].append(np.min(brier_scores))
-            self.stats["avg_confidence"].append(avg_confidence)
-            self.stats["std_confidence"].append(confidence_tensor.std().item())
-            self.stats["avg_task_reward"].append(avg_task_reward)
+        # --- 7. Update running statistics ---
+        if num_total_samples > 0:
+            # --- DEBUG FIX: Write to the correct stat keys ---
+            self.stats["avg_brier"].append(avg_valid_brier) 
+            
+            # --- DEBUG FIX: Use 'valid_brier_scores' and handle empty list ---
+            self.stats["std_brier"].append(np.std(valid_brier_scores) if valid_brier_scores else 0.0)
+            self.stats["max_brier"].append(np.max(valid_brier_scores) if valid_brier_scores else 0.0)
+            self.stats["min_brier"].append(np.min(valid_brier_scores) if valid_brier_scores else 0.0)
+            
+            # --- DEBUG FIX: Write to the correct stat keys ---
+            self.stats["avg_confidence"].append(avg_valid_confidence)
+            self.stats["std_confidence"].append(np.std(valid_confidences) if valid_confidences else 0.0)
+            self.stats["avg_task_reward"].append(avg_valid_original_task_reward)
             
             self.stats["constraint_violation"].append(current_constraint_violation)
             self.stats["lagrange_multiplier"].append(self.lagrange_multiplier)
-            self.stats["num_violations"].append(num_violations / num_samples)
-            self.stats["penalty_magnitude"].append(total_penalty / num_samples)
             
-            # Satisfaction rate (Brier score within target)
-            within_target = sum(1 for b in brier_scores if b <= self.target_brier_score)
-            self.stats["satisfaction_rate"].append(within_target / num_samples)
-
-            # Penalty statistics
-            penalties = [max(0, self.lagrange_multiplier * v) for v in sample_violations]
-            non_zero_penalties = [p for p in penalties if p > 1e-6]
-            if non_zero_penalties:
-                self.stats["penalty_active_rate"].append(len(non_zero_penalties) / len(penalties))
-                self.stats["avg_active_penalty"].append(np.mean(non_zero_penalties))
-            else:
+            # Statistics based on valid samples
+            if num_valid_samples > 0:
+                self.stats["num_violations"].append(num_violations / num_valid_samples)
+                self.stats["penalty_magnitude"].append(total_penalty / num_valid_samples)
+                
+                # --- DEBUG FIX: 'satisfaction_rate' logic ---
+                # Check how many valid brier scores were at or below the target
+                within_target = sum(1 for b in valid_brier_scores if b <= self.target_brier_score)
+                self.stats["satisfaction_rate"].append(within_target / num_valid_samples)
+                
+                # 'valid_sample_violations' only contains violations > 0
+                non_zero_penalties = valid_sample_violations
+                if non_zero_penalties:
+                    self.stats["penalty_active_rate"].append(len(non_zero_penalties) / num_valid_samples)
+                    self.stats["avg_active_penalty"].append(
+                        np.mean([self.lagrange_multiplier * v for v in non_zero_penalties])
+                    )
+                else:
+                    self.stats["penalty_active_rate"].append(0.0)
+                    self.stats["avg_active_penalty"].append(0.0)
+            else: # If entire batch had format errors or was empty
+                self.stats["num_violations"].append(0.0)
+                self.stats["penalty_magnitude"].append(0.0)
+                self.stats["satisfaction_rate"].append(0.0)
                 self.stats["penalty_active_rate"].append(0.0)
                 self.stats["avg_active_penalty"].append(0.0)
-                
+
             # Lambda change rate
-            if len(self.stats["lagrange_multiplier"]) > 1:
-                self.stats["lambda_change_rate"].append(
-                    (self.stats["lagrange_multiplier"][-1] - self.stats["lagrange_multiplier"][-2])
-                )
-            else:
-                self.stats["lambda_change_rate"].append(0.0)
+            self.stats["lambda_change_rate"].append(lambda_change)
         
-        # 8. Return
+        # --- 8. Return ---
         if return_dict:
             return {
                 "reward_tensor": reward_tensor,
                 "reward_extra_info": {
-                    "avg_brier_score": avg_brier,
-                    "avg_confidence": avg_confidence,
-                    "max_brier_score": np.max(brier_scores) if brier_scores else 0,
-                    "min_brier_score": np.min(brier_scores) if brier_scores else 0,
-                    "lagrange_multiplier": self.lagrange_multiplier,
-                    "num_violations": num_violations,
-                    "avg_penalty_magnitude": total_penalty / num_samples if num_samples > 0 else 0,
+                    # Log batch-specific, valid-only stats
+                    "calash/avg_brier_valid_batch": avg_valid_brier,
+                    "calash/avg_confidence_valid_batch": avg_valid_confidence,
+                    "calash/lambda": self.lagrange_multiplier,
+                    "calash/num_format_errors_batch": num_total_samples - num_valid_samples,
                 }
             }
         else:
@@ -238,6 +258,8 @@ class CalashRewardManager:
         if self.stats["penalty_magnitude"]:
             metrics["calash/avg_penalty"] = self.stats["penalty_magnitude"][-1]
             metrics["calash/penalty_active_rate"] = self.stats["penalty_active_rate"][-1]
+            
+            # --- DEBUG FIX: Move this check inside and add its own list check ---
             if self.stats["avg_active_penalty"]:
                 metrics["calash/avg_active_penalty"] = self.stats["avg_active_penalty"][-1]
                     

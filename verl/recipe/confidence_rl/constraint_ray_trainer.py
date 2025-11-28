@@ -467,6 +467,7 @@ class RayConstraintTrainer(RayPPOTrainer):
 
                         new_batch.batch["token_level_scores"] = reward_tensor
                         new_batch.batch["confidence_tensor"] = torch.tensor(reward_extra_infos_dict["confidence"])
+                        new_batch.batch["acc_tensor"] = torch.tensor(reward_extra_infos_dict["acc"])
 
                         print(f"{list(reward_extra_infos_dict.keys())=}")
                         if reward_extra_infos_dict:
@@ -480,6 +481,9 @@ class RayConstraintTrainer(RayPPOTrainer):
 
                         # Apply Lagrangian constraints if enabled
                         if self.use_constraints and self.constraint_manager is not None:
+
+                            new_batch.batch["original_token_level_scores"] = new_batch.batch["token_level_scores"].clone()
+
                             constraint_result = self.constraint_manager.compute_constrained_reward(
                                 new_batch,
                                 return_dict=True
@@ -487,6 +491,7 @@ class RayConstraintTrainer(RayPPOTrainer):
                             
                             # Update rewards with constrained values
                             new_batch.batch["token_level_scores"] = constraint_result["reward_tensor"]
+                            metrics.update({"calash/num_format_errors_batch": constraint_result["reward_extra_info"]["calash/num_format_errors_batch"]})
                             
                             # Update metrics with constraint info
                             constraint_metrics = self.constraint_manager.get_metrics()
@@ -546,6 +551,9 @@ class RayConstraintTrainer(RayPPOTrainer):
                             # Align the batch
                             traj_bsz = self.config.data.train_batch_size * self.config.actor_rollout_ref.rollout.n
                             batch = batch[:traj_bsz]
+
+                    #breakpoint()
+                    metrics.update({"critic/original_rewards/mean": batch.batch['original_token_level_scores'].mean().item()})
 
                     # === Updating ===
                     if "response_mask" not in batch.batch:

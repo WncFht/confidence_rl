@@ -54,7 +54,7 @@ def gen_correctness_reward(completions, answer, **kwargs):
 
     return matches
 
-def math_reward_func(data_source, solution_str, ground_truth, extra_info=None):
+def math_reward_func(data_source, solution_str, ground_truth, extra_info=None, FORMAT_PENALTY=-2.0):
     """
     根据 solution_str (模型输出) 和 ground_truth (标准答案) 计算奖励。
     
@@ -76,13 +76,12 @@ def math_reward_func(data_source, solution_str, ground_truth, extra_info=None):
     # Get all <answer>...</answer> occurrences
     ans_matches = re.findall(answer_pattern, solution_str, re.DOTALL | re.MULTILINE)
     
-    
     # Format Error
     if len(conf_matches) == 0 or len(ans_matches) == 0:
         return {
-            "score": -2.0,
-            "acc": -1.0,
-            "confidence": -1.0
+            "score": FORMAT_PENALTY,
+            "acc": 0,
+            "confidence": 1
         }
     
     # 1. 提取置信度 (Confidence)
@@ -93,9 +92,9 @@ def math_reward_func(data_source, solution_str, ground_truth, extra_info=None):
 
     if _conf_format == -1:
         return {
-            "score": -2.0,
-            "acc": -1.0,
-            "confidence": -1.0
+            "score": FORMAT_PENALTY,
+            "acc": 0,
+            "confidence": 1
         }
 
     # 2. 评估正确性 (Accuracy / Score)
