@@ -14,13 +14,13 @@ def confidence_extractor(response, **kwargs):
     # Get all <confidence>...</confidence> occurrences
     conf_matches = re.findall(conf_pattern, response, re.DOTALL | re.MULTILINE)
     # Get the last confidence, if exists
-    last_confidence = conf_matches[-1] if conf_matches else ""
+    last_confidence = conf_matches[-1].strip() if conf_matches else ""
     if last_confidence == "":
         return 0, 0.0
     else:
         try:
             confidence = float(last_confidence)
-            if confidence > 1 and confidence <= 100:
+            if confidence >= 0 and confidence <= 100:
                 return 1, confidence/100
             elif confidence >= 0 and confidence <= 1:
                 return 1, confidence
