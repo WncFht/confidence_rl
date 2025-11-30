@@ -52,12 +52,12 @@ INSTRUCT_PROMPT = (
     "1. **Thought Process (<think>):** First, provide a detailed reasoning process, steps, and logic for solving the problem inside the `<think>` tags.\n"
     "2. **Final Answer (<answer>):** Next, provide the final answer to the question inside the `<answer>` tags.\n"
     "3. **Confidence Analysis (<analysis>):** Then, analyze your level of confidence in the solution and any potential uncertainties inside the `<analysis>` tags.\n"
-    "4. **Confidence Score (<confidence>):** Finally, provide a numerical score between **0 and 1** inside the `<confidence>` tags, representing your confidence level.\n\n"
+    "4. **Confidence Score (<confidence>):** Finally, provide a numerical score between **0 and 100** inside the `<confidence>` tags, representing your confidence level.\n\n"
     "**Strictly Required Format:**\n"
     "<think> [Reasoning process / Steps to solve the problem] </think>"
     "<answer> [Final answer] </answer>"
     "<analysis> [Analysis of confidence and uncertainty] </analysis>"
-    "<confidence> [Numerical value between 0 and 1] </confidence>"
+    "<confidence> [Numerical value between 0 and 100] </confidence>"
     "\nProblem:\n"
 )
 
