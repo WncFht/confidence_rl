@@ -22,6 +22,7 @@ import ray
 from verl.trainer.ppo.reward import get_custom_reward_fn
 
 from .constraint_ray_trainer import RayConstraintTrainer
+from .constraint_ray_trainer_2_adv import RayConstraintTrainer
 
 
 @hydra.main(config_path="config", config_name="constraint_trainer", version_base=None)
