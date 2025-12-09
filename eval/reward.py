@@ -67,7 +67,7 @@ def gen_correctness_reward(completions, answer, **kwargs):
 
     return matches
 
-def math_reward_func(data_source, solution_str, ground_truth, extra_info=None, FORMAT_PENALTY=-2.0):
+def math_reward_func(data_source, solution_str, ground_truth, extra_info=None, FORMAT_PENALTY=0.0):
     """
     根据 solution_str (模型输出) 和 ground_truth (标准答案) 计算奖励。
     
@@ -131,9 +131,7 @@ def math_reward_func(data_source, solution_str, ground_truth, extra_info=None, F
     
     # 3. 设置分数 (Score)
     # 对于单个样本评估, score 和 acc 相同 (都是 1.0 或 0.0)
-    score =  1.0 if acc == 1.0 else -1.0
-
-
+    score =  1.0 if acc == 1.0 else 0.0
 
     # 4. 返回要求的字典
     return {
