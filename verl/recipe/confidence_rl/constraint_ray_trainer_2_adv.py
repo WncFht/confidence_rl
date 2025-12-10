@@ -613,7 +613,7 @@ class RayConstraintTrainer(RayPPOTrainer):
                         new_batch.batch["acc_tensor"] = torch.tensor(reward_extra_infos_dict["acc"])
 
                         # compute brier score
-                        new_batch.batch["brier_tensor"] =  (new_batch.batch["acc_tensor"] - new_batch.batch["confidence_tensor"]) ** 2
+                        new_batch.batch["brier_tensor"] =  -1.0 * (new_batch.batch["acc_tensor"] - new_batch.batch["confidence_tensor"]) ** 2
 
 
                         print(f"{list(reward_extra_infos_dict.keys())=}")
