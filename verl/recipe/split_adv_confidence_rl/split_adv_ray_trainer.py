@@ -593,6 +593,14 @@ class RaySplitAdvConfidenceTrainer(RayPPOTrainer):
                     # split mask by answer tag
                     acc_response_mask, confidence_response_mask = self.split_mask_by_answer_tag(batch.batch, self.tokenizer)
 
+                    # compute answer_tokens and confidence_tokens length
+                    answer_tokens_length = acc_response_mask.sum(dim=-1).float().mean().item()
+                    confidence_tokens_length = confidence_response_mask.sum(dim=-1).float().mean().item()
+                    
+                    # Add answer_tokens and confidence_tokens length statistics to metrics
+                    metrics.update({"tokens_length/answer_tokens/mean": answer_tokens_length})
+                    metrics.update({"tokens_length/confidence_tokens/mean": confidence_tokens_length})
+
                     # clone and set response mask
                     # FIX: acc_batch also needs deepcopy, otherwise modifying its mask will affect the original batch
                     acc_batch = deepcopy(batch)
