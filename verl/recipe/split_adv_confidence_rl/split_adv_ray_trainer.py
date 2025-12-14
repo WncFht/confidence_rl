@@ -165,6 +165,8 @@ class RaySplitAdvConfidenceTrainer(RayPPOTrainer):
         confidence_lst = []
         brier_score_lst = [] 
         format_lst = [] # 0/1, 0: incorrect, 1: correct
+        answer_tokens_length_lst = []
+        confidence_tokens_length_lst = []
         
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
@@ -208,6 +210,16 @@ class RaySplitAdvConfidenceTrainer(RayPPOTrainer):
                 return response_length
                 
             length_lst.append(obtain_response_length(test_output_gen_batch))
+            
+            # compute answer_tokens_length and confidence_tokens_length
+            if "response_mask" not in test_output_gen_batch.batch:
+                test_output_gen_batch.batch["response_mask"] = compute_response_mask(test_output_gen_batch)
+            acc_response_mask, confidence_response_mask = self.split_mask_by_answer_tag(
+                test_output_gen_batch.batch, self.tokenizer
+            )
+            answer_tokens_length_lst.append(acc_response_mask.sum(dim=-1).float().mean().item())
+            confidence_tokens_length_lst.append(confidence_response_mask.sum(dim=-1).float().mean().item())
+            
             reward_acc_lst.append(reward_acc)
             confidence_lst.append(confidence)
             brier_score_lst.append(brier_scores)
@@ -314,6 +326,10 @@ class RaySplitAdvConfidenceTrainer(RayPPOTrainer):
         metric_dict['result/avg_brier_score'] = np.mean(test_brier_score_vals)
         metric_dict['result/avg_auroc'] = np.mean(test_auroc_vals) if len(test_auroc_vals) > 0 else 0.0
         metric_dict['result/avg_ece'] = np.mean(test_ece_vals) if len(test_ece_vals) > 0 else 0.0
+        
+        # Compute average answer_tokens_length and confidence_tokens_length
+        metric_dict['result/answer_tokens_length'] = np.mean(answer_tokens_length_lst) if len(answer_tokens_length_lst) > 0 else 0.0
+        metric_dict['result/confidence_tokens_length'] = np.mean(confidence_tokens_length_lst) if len(confidence_tokens_length_lst) > 0 else 0.0
           
         return metric_dict
 
