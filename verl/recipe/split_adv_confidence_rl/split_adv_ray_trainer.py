@@ -153,6 +153,7 @@ class RaySplitAdvConfidenceTrainer(RayPPOTrainer):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.config.actor_rollout_ref.actor.ppo_mini_batch_size *= 2
         self.group_confidence_adv_by_acc = self.config.algorithm.get("group_confidence_adv_by_acc", False)
 
     def _validate(self):
@@ -620,7 +621,17 @@ class RaySplitAdvConfidenceTrainer(RayPPOTrainer):
                             group_by_acc=group_confidence_adv_by_acc,
                         )
 
+                        # TODO: concat acc and confidence batch in a better way
+                        # Currently, we concat them directly, which might cause some problems
+                        # 交错concat，或者根据acc和confidence的顺序，交替concat
+                        
                         batch = DataProto.concat([acc_batch, confidence_batch])
+                        n = len(acc_batch)
+                        indices = []
+                        for i in range(n):
+                            indices.append(i)      # from data1
+                            indices.append(i + n)  # from data2
+                        batch = batch.select_idxs(indices)
 
                     # update critic
                     if self.use_critic:
