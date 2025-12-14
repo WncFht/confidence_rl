@@ -334,36 +334,68 @@ class RaySplitAdvConfidenceTrainer(RayPPOTrainer):
         return metric_dict
 
     def split_mask_by_answer_tag(self, batch, tokenizer):
+        """
+        将 response_mask 分成两部分：
+        1. acc_response_mask: </answer> 标签之前的内容（包括标签本身）
+        2. conf_response_mask: </answer> 标签之后的内容
+        
+        逻辑说明：
+        - 使用滑动窗口查找 </answer> 标签的最后一个出现位置
+        - 如果找到标签在位置 [start, start+tag_len)，则：
+          * 答案部分：位置 [0, start+tag_len)（包括整个标签）
+          * 置信度部分：位置 [start+tag_len, seq_len)
+        - 如果未找到标签，全部归为答案部分
+        """
         responses = batch['responses']
         original_mask = batch['response_mask']
         device = responses.device
         batch_size, seq_len = responses.size()
 
-        answer_tokens = tokenizer.encode("</answer>", add_special_tokens=False)
+        answer_tokens = tokenizer.encode("</answer>", add_special_tokens=False)[1:]
         answer_tokens_tensor = torch.tensor(answer_tokens, device=device)
         tag_len = len(answer_tokens)
 
-        windows = responses.unfold(1, tag_len, 1)
-        matches = (windows == answer_tokens_tensor).all(dim=-1)
-        
-        found_mask = matches.any(dim=1)
+        # 边界检查：如果序列长度小于标签长度，无法找到标签
+        if seq_len < tag_len:
+            # 序列太短，无法包含标签，全部归为答案部分
+            acc_response_mask = original_mask.clone()
+            conf_response_mask = torch.zeros_like(original_mask)
+            return acc_response_mask, conf_response_mask
 
+        # 使用滑动窗口查找标签
+        # unfold(1, tag_len, 1) 在维度1上创建大小为 tag_len 的滑动窗口
+        # 结果形状: (batch_size, num_windows, tag_len)
+        windows = responses.unfold(1, tag_len, 1)
+        # 检查每个窗口是否匹配标签
+        matches = (windows == answer_tokens_tensor).all(dim=-1)  # (batch_size, num_windows)
+        
+        found_mask = matches.any(dim=1)  # (batch_size,) 每个样本是否找到标签
+
+        # 找到最后一个匹配的窗口索引（即标签开始位置）
+        # positions: 窗口索引 [0, 1, 2, ..., num_windows-1]
         positions = torch.arange(matches.size(1), device=matches.device).unsqueeze(0).expand_as(matches)
+        # last_match_index: 最后一个匹配的窗口索引，如果没找到则为 -1
         last_match_index = torch.where(matches, positions, -1).max(dim=1).values
         
+        # 如果找到标签，start_indices 是标签开始位置；否则设为 seq_len
         start_indices = torch.where(
             found_mask, 
             last_match_index, 
             torch.tensor(seq_len, device=device, dtype=torch.long)
         )
 
+        # end_indices: 标签结束位置+1（即标签后的第一个位置）
         end_indices = torch.clamp(start_indices + tag_len, max=seq_len)
-        seq_range = torch.arange(seq_len, device=device).unsqueeze(0)
-
-        acc_pos_mask = seq_range < end_indices.unsqueeze(1)
+        
+        # 创建位置范围用于比较
+        seq_range = torch.arange(seq_len, device=device).unsqueeze(0)  # (1, seq_len)
+        
+        # 答案部分：位置 < end_indices（包括整个标签）
+        acc_pos_mask = seq_range < end_indices.unsqueeze(1)  # (batch_size, seq_len)
         acc_response_mask = original_mask & acc_pos_mask.type_as(original_mask)
 
-        conf_pos_mask = seq_range >= end_indices.unsqueeze(1)
+        # 置信度部分：位置 >= end_indices（标签之后）
+        conf_pos_mask = seq_range >= end_indices.unsqueeze(1)  # (batch_size, seq_len)
         conf_response_mask = original_mask & conf_pos_mask.type_as(original_mask)
 
         return acc_response_mask, conf_response_mask
