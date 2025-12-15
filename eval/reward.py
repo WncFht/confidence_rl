@@ -67,7 +67,7 @@ def gen_correctness_reward(completions, answer, **kwargs):
 
     return matches
 
-def math_reward_func(data_source, solution_str, ground_truth, extra_info=None, FORMAT_PENALTY=-1.0):
+def math_reward_func(data_source, solution_str, ground_truth, extra_info=None):
     """
     根据 solution_str (模型输出) 和 ground_truth (标准答案) 计算奖励。
     
@@ -81,18 +81,12 @@ def math_reward_func(data_source, solution_str, ground_truth, extra_info=None, F
         一个包含 score, acc, 和 confidence 的字典。
     """
     # format check
-    conf_pattern = r"<confidence>(.*?)</confidence>"
-    # Get all <confidence>...</confidence> occurrences
-    conf_matches = re.findall(conf_pattern, solution_str, re.DOTALL | re.MULTILINE)
+    answer_pattern = r".*?</think>\s*<answer>.*?</answer>\s*<analysis>.*?</analysis>\s*<confidence>.*?</confidence>\s*\Z"
+    match = re.match(answer_pattern, solution_str, re.DOTALL | re.MULTILINE)
 
-    answer_pattern = r"<answer>(.*?)</answer>"
-    # Get all <answer>...</answer> occurrences
-    ans_matches = re.findall(answer_pattern, solution_str, re.DOTALL | re.MULTILINE)
-    
-    # Format Error
-    if len(conf_matches) == 0 or len(ans_matches) == 0:
+    if not match:
         return {
-            "score": FORMAT_PENALTY,
+            "score": 0.0,
             "acc": 0.0,
             "confidence": 1.0,
             "format": 0
@@ -106,7 +100,7 @@ def math_reward_func(data_source, solution_str, ground_truth, extra_info=None, F
 
     if _conf_format == 0:
         return {
-            "score": FORMAT_PENALTY,
+            "score": 0.0,
             "acc": 0.0,
             "confidence": 1.0,
             "format": 0
@@ -138,5 +132,5 @@ def math_reward_func(data_source, solution_str, ground_truth, extra_info=None, F
         "score": score,
         "acc": acc,
         "confidence": confidence,
-        "format": 1
+        "format": 1.0
     }

@@ -102,7 +102,7 @@ def compute_ece(y_true, y_score, n_bins=10):
     
     return ece
 
-def compute_confidence_advantage(data: DataProto, adv_estimator, norm_adv_by_std_in_grpo=True, group_by_acc=False):
+def compute_confidence_advantage(data: DataProto, adv_estimator, norm_adv_by_std_in_grpo=True, group_by_acc=False, confidence_adv_weight=1.0):
     if adv_estimator == "GRPO":
         # TODO: test on more adv estimator type
         grpo_calculation_mask = data.batch["response_mask"]
@@ -120,19 +120,33 @@ def compute_confidence_advantage(data: DataProto, adv_estimator, norm_adv_by_std
         # Compute reward: when format=0, use the value of token_level_scores; otherwise use 1 - brier_score
         # format_tensor is (batch_size,), brier_score is (batch_size,)
         # We need to expand format_tensor to token level for token_level_rewards
-        format_tensor = data.batch["format_tensor"]  # (batch_size,)
-        brier_score = data.batch["brier_score"]  # (batch_size,)
-        
-        # Compute base reward: 1 - brier_score
-        base_reward = 1 - brier_score  # (batch_size,)
-        
-        # When format=0, set reward to the value of token_level_scores; otherwise use base_reward
-        sequence_reward = torch.where(format_tensor == 0, data.batch["token_level_scores"].sum(dim=-1), base_reward)
         
         # Expand to token level: (batch_size,) -> (batch_size, 1) for unsqueeze
-        token_level_rewards = sequence_reward.unsqueeze(-1)  # (batch_size, 1)
+        token_level_rewards = data.batch["confidence_reward"].unsqueeze(-1)  # (batch_size, 1)
         
         # Call compute_grpo_outcome_advantage with parameters matching its definition
+        advantages, returns = core_algos.compute_grpo_outcome_advantage(
+            token_level_rewards=token_level_rewards,
+            response_mask=grpo_calculation_mask,
+            index=grouping_index,
+            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+        )
+        data.batch["advantages"] = advantages * confidence_adv_weight
+        data.batch["returns"] = returns
+    else:
+        raise NotImplementedError
+
+    return data
+
+def compute_accuracy_advantage(data: DataProto, adv_estimator, norm_adv_by_std_in_grpo=True):
+    if adv_estimator == "GRPO":
+        # TODO: test on more adv estimator type
+        grpo_calculation_mask = data.batch["response_mask"]
+      
+        grouping_index = data.non_tensor_batch["uid"]
+
+        token_level_rewards = data.batch["accuracy_reward"]
+        
         advantages, returns = core_algos.compute_grpo_outcome_advantage(
             token_level_rewards=token_level_rewards,
             response_mask=grpo_calculation_mask,
@@ -517,8 +531,6 @@ class RaySplitAdvConfidenceTrainer(RayPPOTrainer):
                         new_batch.batch["confidence_tensor"] = torch.tensor(reward_extra_infos_dict["confidence"])
                         new_batch.batch["format_tensor"] = torch.tensor(reward_extra_infos_dict["format"])
                         new_batch.batch["acc_tensor"] = torch.tensor(reward_extra_infos_dict["acc"])
-
-                        # compute brier score
                         new_batch.batch["brier_score"] =  1.0 * (new_batch.batch["acc_tensor"] - new_batch.batch["confidence_tensor"]) ** 2
 
                         print(f"{list(reward_extra_infos_dict.keys())=}")
@@ -538,51 +550,7 @@ class RaySplitAdvConfidenceTrainer(RayPPOTrainer):
                         else:
                             new_batch.batch["token_level_rewards"] = new_batch.batch["token_level_scores"]
 
-                    if not self.config.algorithm.filter_groups.enable:
                         batch = new_batch
-                    else:  # NOTE: When prompts after filtering is less than train batch size,
-                        # we skip to the next generation batch
-                        metric_name = self.config.algorithm.filter_groups.metric
-                        if metric_name == "seq_final_reward":
-                            # Turn to numpy for easier filtering
-                            new_batch.non_tensor_batch["seq_final_reward"] = new_batch.batch["token_level_rewards"].sum(dim=-1).numpy()
-                        elif metric_name == "seq_reward":
-                            new_batch.non_tensor_batch["seq_reward"] = new_batch.batch["token_level_scores"].sum(dim=-1).numpy()
-
-                        # Collect the sequence reward for each trajectory
-                        prompt_uid2metric_vals = defaultdict(list)
-                        for uid, metric_val in zip(new_batch.non_tensor_batch["uid"], new_batch.non_tensor_batch[metric_name]):
-                            prompt_uid2metric_vals[uid].append(metric_val)
-
-                        prompt_uid2metric_std = {}
-                        for prompt_uid, metric_vals in prompt_uid2metric_vals.items():
-                            prompt_uid2metric_std[prompt_uid] = np.std(metric_vals)
-
-                        kept_prompt_uids = [uid for uid, std in prompt_uid2metric_std.items() if std > 0 or len(prompt_uid2metric_vals[uid]) == 1]
-                        num_prompt_in_batch += len(kept_prompt_uids)
-
-                        kept_traj_idxs = []
-                        for idx, traj_from_prompt_uid in enumerate(new_batch.non_tensor_batch["uid"]):
-                            if traj_from_prompt_uid in kept_prompt_uids:
-                                kept_traj_idxs.append(idx)
-
-                        new_batch = new_batch[kept_traj_idxs]
-                        batch = new_batch if batch is None else DataProto.concat([batch, new_batch])
-
-                        prompt_bsz = self.config.data.train_batch_size
-                        if num_prompt_in_batch < prompt_bsz:
-                            print(f"{num_prompt_in_batch=} < {prompt_bsz=}")
-                            max_num_gen_batches = self.config.algorithm.filter_groups.max_num_gen_batches
-                            if max_num_gen_batches <= 0 or num_gen_batches < max_num_gen_batches:
-                                print(f"{num_gen_batches=}. Keep generating...")
-                                progress_bar.update(1)
-                                continue
-                            else:
-                                raise ValueError(f"{num_gen_batches=} >= {max_num_gen_batches=}." + " Generated too many. Please check if your data are too difficult." + " You could also try set max_num_gen_batches=0 to enable endless trials.")
-                        else:
-                            # Align the batch
-                            traj_bsz = self.config.data.train_batch_size * self.config.actor_rollout_ref.rollout.n
-                            batch = batch[:traj_bsz]
 
                     metrics.update({"format/valid_num": batch.batch['format_tensor'].sum().item()})
                     metrics.update({"confidence_metrics/brier_score/mean": batch.batch['brier_score'].mean().item()})
@@ -598,6 +566,9 @@ class RaySplitAdvConfidenceTrainer(RayPPOTrainer):
                     
                     metrics.update({"confidence_metrics/auroc": train_auroc})
                     metrics.update({"confidence_metrics/ece": train_ece})
+
+                    batch.batch["confidence_reward"] = 1 - batch.batch["brier_score"] + batch.batch["format_tensor"]
+                    batch.batch["accuracy_reward"] = batch.batch["acc_tensor"] + batch.batch["format_tensor"]
                         
                     # === Updating ===
                     if "response_mask" not in batch.batch:
@@ -675,6 +646,7 @@ class RaySplitAdvConfidenceTrainer(RayPPOTrainer):
                             adv_estimator="GRPO",
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             group_by_acc=group_confidence_adv_by_acc,
+                            confidence_adv_weight=self.config.algorithm.get("confidence_adv_weight", 1.0),
                         )
 
                         # TODO: concat acc and confidence batch in a better way
