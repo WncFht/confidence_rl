@@ -1,0 +1,706 @@
+# Copyright 2024 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""
+FSDP PPO Trainer with Ray-based single controller.
+This trainer supports model-agonistic model initialization with huggingface
+"""
+import uuid
+from collections import defaultdict
+from copy import deepcopy
+from pprint import pprint
+
+import numpy as np
+import torch
+from tqdm import tqdm
+from sklearn.metrics import roc_auc_score
+
+from verl import DataProto
+from verl.trainer.ppo.core_algos import agg_loss
+from verl.trainer.ppo.metric_utils import (
+    compute_data_metrics,
+    compute_throughout_metrics,
+    compute_timing_metrics,
+    reduce_metrics,
+)
+from verl.trainer.ppo.ray_trainer import AdvantageEstimator, RayPPOTrainer, _timer, apply_kl_penalty, compute_advantage, compute_response_mask
+from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
+
+from verl.trainer.ppo import core_algos
+
+def compute_auroc(y_true, y_score):
+    """
+    Compute Area under ROC curve (AUROC).
+    
+    Args:
+        y_true: True binary labels (0 or 1)
+        y_score: Predicted probabilities
+        
+    Returns:
+        AUROC score, or 0.0 if computation fails (e.g., only one class present)
+    """
+    try:
+        # Check if we have both classes
+        if len(np.unique(y_true)) < 2:
+            return 0.0
+        return roc_auc_score(y_true, y_score)
+    except Exception:
+        return 0.0
+
+def compute_ece(y_true, y_score, n_bins=10):
+    """
+    Compute Expected Calibration Error (ECE).
+    
+    ECE = sum(|Bm|/N * |acc(Bm) - conf(Bm)|)
+    where M is the number of bins, Bm is the set of samples in bin m, and N is the number of samples.
+    
+    Args:
+        y_true: True binary labels (0 or 1)
+        y_score: Predicted probabilities
+        n_bins: Number of bins (default: 10)
+        
+    Returns:
+        ECE score
+    """
+    if len(y_true) == 0:
+        return 0.0
+    
+    # Bin the predictions
+    bin_boundaries = np.linspace(0, 1, n_bins + 1)
+    bin_lowers = bin_boundaries[:-1]
+    bin_uppers = bin_boundaries[1:]
+    
+    ece = 0.0
+    n = len(y_true)
+    
+    for bin_lower, bin_upper in zip(bin_lowers, bin_uppers):
+        # Find samples in this bin
+        # For the first bin, include the lower boundary (0)
+        if bin_lower == 0:
+            in_bin = (y_score >= bin_lower) & (y_score <= bin_upper)
+        else:
+            in_bin = (y_score > bin_lower) & (y_score <= bin_upper)
+        prop = np.mean(in_bin)
+        
+        if prop > 0:
+            # Accuracy in this bin
+            accuracy_in_bin = np.mean(y_true[in_bin])
+            # Average confidence in this bin
+            avg_confidence_in_bin = np.mean(y_score[in_bin])
+            # Add to ECE
+            ece += np.abs(avg_confidence_in_bin - accuracy_in_bin) * prop
+    
+    return ece
+
+# NOTE(sgm): this implementation only consider outcome supervision, where the reward is a scalar.
+def compute_grpo_outcome_advantage(
+    scores: torch.Tensor,
+    index: np.ndarray,
+    epsilon: float = 1e-6,
+    norm_adv_by_std_in_grpo: str = True,
+):
+    """
+    Compute advantage for GRPO, operating only on Outcome reward
+    (with only one scalar reward for each response).
+
+    Args:
+        scores: `(torch.Tensor)`
+            shape is (bs,)
+        norm_adv_by_std_in_grpo: (bool)
+            whether to scale the GRPO advantage.
+            If True, the advantage is scaled by the std, as in the original GRPO.
+            If False, the advantage is not scaled, as in Dr.GRPO (https://arxiv.org/abs/2503.20783).
+
+    Returns:
+        advantages: `(torch.Tensor)`
+            shape is (bs,)
+    """
+    id2score = defaultdict(list)
+    id2mean = {}
+    id2std = {}
+
+    with torch.no_grad():
+        bsz = scores.shape[0]
+        for i in range(bsz):
+            id2score[index[i]].append(scores[i])
+        for idx in id2score:
+            if len(id2score[idx]) == 1:
+                id2mean[idx] = torch.tensor(0.0)
+                id2std[idx] = torch.tensor(1.0)
+            elif len(id2score[idx]) > 1:
+                id2mean[idx] = torch.mean(torch.tensor(id2score[idx]))
+                id2std[idx] = torch.std(torch.tensor([id2score[idx]]))
+            else:
+                raise ValueError(f"no score in prompt index: {idx}")
+        for i in range(bsz):
+            if norm_adv_by_std_in_grpo:
+                scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
+            else:
+                scores[i] = scores[i] - id2mean[index[i]]
+
+    return scores
+
+def compute_accuracy_and_confidence_advantage(data: DataProto, norm_adv_by_std_in_grpo=True, group_by_acc=False):
+    
+    # Compute accuracy advantage
+    accuracy_advantages = compute_grpo_outcome_advantage(
+        scores= data.batch["accuracy_reward"].clone(),
+        index=data.non_tensor_batch["uid"],
+        norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+    )
+    accuracy_advantages = accuracy_advantages.unsqueeze(-1) * data.batch["accuracy_response_mask"]
+
+    # Compute confidence advantage
+
+    if group_by_acc:
+        raise NotImplementedError
+    else:
+        grouping_index = data.non_tensor_batch["uid"]
+
+    confidence_advantages = compute_grpo_outcome_advantage(
+        scores= data.batch["confidence_reward"].clone(),
+        index=grouping_index,
+        norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+    )
+    confidence_advantages = confidence_advantages.unsqueeze(-1) * data.batch["confidence_response_mask"]
+
+    return accuracy_advantages, confidence_advantages
+
+
+class RaySplitAdvConfidenceTrainer(RayPPOTrainer):
+    """
+    Note that this trainer runs on the driver process on a single CPU/GPU node.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.group_confidence_adv_by_acc = self.config.algorithm.get("group_confidence_adv_by_acc", False)
+
+    def _validate(self):
+        print("Validation: Generation Begin.")
+        
+        reward_acc_lst = []
+        data_source_lst = []
+        length_lst = []
+        confidence_lst = []
+        brier_score_lst = [] 
+        format_lst = [] # 0/1, 0: incorrect, 1: correct
+        answer_tokens_length_lst = []
+        confidence_tokens_length_lst = []
+        
+        for test_data in self.val_dataloader:
+            test_batch = DataProto.from_single_dict(test_data)
+            # test_batch = test_batch.to('cuda')
+        
+            # we only do validation on rule-based rm
+            if self.config.reward_model.enable and test_batch[0].non_tensor_batch['reward_model']['style'] == 'model':
+                return {}
+        
+            n_val_samples = self.config.actor_rollout_ref.rollout.val_kwargs.n
+            test_batch = test_batch.repeat(repeat_times=n_val_samples, interleave=True)
+            test_gen_batch = test_batch.pop(['input_ids', 'attention_mask', 'position_ids'])
+            test_gen_batch.meta_info = {
+                "eos_token_id": self.tokenizer.eos_token_id,
+                "pad_token_id": self.tokenizer.pad_token_id,
+                "recompute_log_prob": False,
+                "do_sample": self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
+                "validate": True,
+            }
+        
+            # pad to be divisible by dp_size
+            test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, self.actor_rollout_wg.world_size)
+            test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
+            # unpad
+            test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
+        
+            test_batch = test_batch.union(test_output_gen_batch)
+            # evaluate using reward_function
+            # for certain reward function (e.g. sandbox), the generation can overlap with reward
+            reward_result = self.val_reward_fn(test_batch, return_dict=True)
+            reward_acc = reward_result["reward_extra_info"]["acc"]  # True label y, assumed to be 0 or 1
+            confidence = reward_result["reward_extra_info"]["confidence"] # Predicted probability p
+            format_scores_batch = reward_result["reward_extra_info"]["format"] # Format, 0 or 1
+        
+            brier_scores = (np.array(confidence) - np.array(reward_acc))**2 
+            
+            # obtain response length
+            def obtain_response_length(output_batch):
+                prompt_length = output_batch.batch['prompts'].shape[-1]
+                response_length = output_batch.batch['attention_mask'][:,prompt_length:].sum(1).numpy()
+                return response_length
+                
+            length_lst.append(obtain_response_length(test_output_gen_batch))
+            
+            # compute answer_tokens_length and confidence_tokens_length
+            if "response_mask" not in test_output_gen_batch.batch:
+                test_output_gen_batch.batch["response_mask"] = compute_response_mask(test_output_gen_batch)
+            acc_response_mask, confidence_response_mask = self.split_mask_by_answer_tag(
+                test_output_gen_batch.batch, self.tokenizer
+            )
+            answer_tokens_length_lst.append(acc_response_mask.sum(dim=-1).float().mean().item())
+            confidence_tokens_length_lst.append(confidence_response_mask.sum(dim=-1).float().mean().item())
+            
+            reward_acc_lst.append(reward_acc)
+            confidence_lst.append(confidence)
+            brier_score_lst.append(brier_scores)
+            data_source_lst.append(test_batch.non_tensor_batch.get('data_source', ['unknown'] * len(reward_acc)))
+            format_lst.append(format_scores_batch)
+        
+        print('Validation: Generation end.')
+        
+        reward_acc = np.concatenate(reward_acc_lst, axis=0) # (batch_size,)
+        data_sources = np.concatenate(data_source_lst, axis=0)
+        lengths = np.concatenate(length_lst, axis=0)
+        confidences = np.concatenate(confidence_lst, axis=0)
+
+        brier_scores = np.concatenate(brier_score_lst, axis=0) 
+        format_scores = np.concatenate(format_lst, axis=0) # 0 or 1
+        
+        # evaluate test_score based on data source
+        data_source_reward = {}
+        data_source_response_lengths = {}
+        data_source_confidence = {}
+        data_source_brier_scores = {}
+        data_source_format_scores = {}
+        
+        for i in range(len(reward_acc)):
+            data_source = data_sources[i]
+            
+            # Accuracy
+            if data_source not in data_source_reward:
+                data_source_reward[data_source] = []
+            data_source_reward[data_source].append(reward_acc[i])
+    
+            # Length
+            if data_source not in data_source_response_lengths:
+                data_source_response_lengths[data_source] = []
+            data_source_response_lengths[data_source].append(lengths[i])
+    
+            if data_source not in data_source_format_scores:
+                data_source_format_scores[data_source] = []
+            data_source_format_scores[data_source].append(format_scores[i])
+    
+            if data_source not in data_source_confidence:
+                data_source_confidence[data_source] = []
+            data_source_confidence[data_source].append(confidences[i])
+            
+            if data_source not in data_source_brier_scores:
+                data_source_brier_scores[data_source] = []
+            data_source_brier_scores[data_source].append(brier_scores[i])
+        
+        
+        metric_dict = {}
+        test_score_vals = []
+        test_length_vals = []
+        test_confidence_vals = []
+        test_brier_score_vals  = [] 
+        test_format_acc_vals = []
+        test_auroc_vals = []
+        test_ece_vals = []
+        
+        for data_source, rewards in data_source_reward.items():
+            metric_dict[f'val/test_score/{data_source}'] = np.mean(rewards)
+            test_score_vals.append(np.mean(rewards))
+    
+        for data_source, formats in data_source_format_scores.items():
+            format_acc = np.mean(formats)
+            metric_dict[f'val/format_acc/{data_source}'] = format_acc
+            test_format_acc_vals.append(format_acc)
+    
+        for data_source, confidence in data_source_confidence.items():
+            mean_confidence = np.mean(confidence)
+            metric_dict[f'val/test_confidence/{data_source}'] = mean_confidence
+            test_confidence_vals.append(mean_confidence)
+        
+        for data_source, brier_terms in data_source_brier_scores.items():
+            mean_brier = np.mean(brier_terms)
+            metric_dict[f'val/test_brier_score/{data_source}'] = mean_brier
+            test_brier_score_vals.append(mean_brier)
+    
+        for data_source, lengths in data_source_response_lengths.items():
+            metric_dict[f'val/test_length/{data_source}'] = np.mean(lengths)
+            test_length_vals.append(np.mean(lengths))
+        
+        # Compute AUROC and ECE for each data source
+        for data_source in data_source_reward.keys():
+            # Get corresponding rewards (acc) and confidences for this data source
+            acc_values = np.array(data_source_reward[data_source])
+            conf_values = np.array(data_source_confidence[data_source])
+            
+            # Compute AUROC
+            auroc = compute_auroc(acc_values, conf_values)
+            metric_dict[f'val/confidence_metrics/auroc/{data_source}'] = auroc
+            test_auroc_vals.append(auroc)
+            
+            # Compute ECE
+            ece = compute_ece(acc_values, conf_values, n_bins=10)
+            metric_dict[f'val/confidence_metrics/ece/{data_source}'] = ece
+            test_ece_vals.append(ece)
+       
+        metric_dict['result/avg_acc'] = np.mean(test_score_vals)
+        metric_dict['result/avg_len'] = np.mean(test_length_vals)
+        
+        metric_dict['result/avg_format_acc'] = np.mean(test_format_acc_vals)
+    
+        metric_dict['result/avg_confidence'] = np.mean(test_confidence_vals)
+        metric_dict['result/avg_brier_score'] = np.mean(test_brier_score_vals)
+        metric_dict['result/avg_auroc'] = np.mean(test_auroc_vals) if len(test_auroc_vals) > 0 else 0.0
+        metric_dict['result/avg_ece'] = np.mean(test_ece_vals) if len(test_ece_vals) > 0 else 0.0
+        
+        # Compute average answer_tokens_length and confidence_tokens_length
+        metric_dict['result/answer_tokens_length'] = np.mean(answer_tokens_length_lst) if len(answer_tokens_length_lst) > 0 else 0.0
+        metric_dict['result/confidence_tokens_length'] = np.mean(confidence_tokens_length_lst) if len(confidence_tokens_length_lst) > 0 else 0.0
+          
+        return metric_dict
+
+    def split_mask_by_answer_tag(self, batch, tokenizer):
+        """
+        将 response_mask 分成两部分：
+        1. acc_response_mask: </answer> 标签之前的内容（包括标签本身）
+        2. conf_response_mask: </answer> 标签之后的内容
+        
+        逻辑说明：
+        - 使用滑动窗口查找 </answer> 标签的最后一个出现位置
+        - 如果找到标签在位置 [start, start+tag_len)，则：
+          * 答案部分：位置 [0, start+tag_len)（包括整个标签）
+          * 置信度部分：位置 [start+tag_len, seq_len)
+        - 如果未找到标签，全部归为答案部分
+        """
+        responses = batch['responses']
+        original_mask = batch['response_mask']
+        device = responses.device
+        batch_size, seq_len = responses.size()
+
+        answer_tokens = tokenizer.encode("</answer>", add_special_tokens=False)[1:]
+        answer_tokens_tensor = torch.tensor(answer_tokens, device=device)
+        tag_len = len(answer_tokens)
+
+        # 边界检查：如果序列长度小于标签长度，无法找到标签
+        if seq_len < tag_len:
+            # 序列太短，无法包含标签，全部归为答案部分
+            acc_response_mask = original_mask.clone()
+            conf_response_mask = torch.zeros_like(original_mask)
+            return acc_response_mask, conf_response_mask
+
+        # 使用滑动窗口查找标签
+        # unfold(1, tag_len, 1) 在维度1上创建大小为 tag_len 的滑动窗口
+        # 结果形状: (batch_size, num_windows, tag_len)
+        windows = responses.unfold(1, tag_len, 1)
+        # 检查每个窗口是否匹配标签
+        matches = (windows == answer_tokens_tensor).all(dim=-1)  # (batch_size, num_windows)
+        
+        found_mask = matches.any(dim=1)  # (batch_size,) 每个样本是否找到标签
+
+        # 找到最后一个匹配的窗口索引（即标签开始位置）
+        # positions: 窗口索引 [0, 1, 2, ..., num_windows-1]
+        positions = torch.arange(matches.size(1), device=matches.device).unsqueeze(0).expand_as(matches)
+        # last_match_index: 最后一个匹配的窗口索引，如果没找到则为 -1
+        last_match_index = torch.where(matches, positions, -1).max(dim=1).values
+        
+        # 如果找到标签，start_indices 是标签开始位置；否则设为 seq_len
+        start_indices = torch.where(
+            found_mask, 
+            last_match_index, 
+            torch.tensor(seq_len, device=device, dtype=torch.long)
+        )
+
+        # end_indices: 标签结束位置+1（即标签后的第一个位置）
+        end_indices = torch.clamp(start_indices + tag_len, max=seq_len)
+        
+        # 创建位置范围用于比较
+        seq_range = torch.arange(seq_len, device=device).unsqueeze(0)  # (1, seq_len)
+        
+        # 答案部分：位置 < end_indices（包括整个标签）
+        acc_pos_mask = seq_range < end_indices.unsqueeze(1)  # (batch_size, seq_len)
+        acc_response_mask = original_mask & acc_pos_mask.type_as(original_mask)
+
+        # 置信度部分：位置 >= end_indices（标签之后）
+        conf_pos_mask = seq_range >= end_indices.unsqueeze(1)  # (batch_size, seq_len)
+        conf_response_mask = original_mask & conf_pos_mask.type_as(original_mask)
+
+        return acc_response_mask, conf_response_mask
+
+    def fit(self):
+        """
+        The training loop of PPO.
+        The driver process only need to call the compute functions of the worker group through RPC
+        to construct the PPO dataflow.
+        The light-weight advantage computation is done on the driver process.
+        """
+        from omegaconf import OmegaConf
+
+        from verl.utils.tracking import Tracking
+
+        logger = Tracking(
+            project_name=self.config.trainer.project_name,
+            experiment_name=self.config.trainer.experiment_name,
+            default_backend=self.config.trainer.logger,
+            config=OmegaConf.to_container(self.config, resolve=True),
+        )
+
+        self.global_steps = 0
+
+        # load checkpoint before doing anything
+        self._load_checkpoint()
+        # perform validation before training
+        # currently, we only support validation using the reward_function.
+        if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
+            if self.config.trainer.get("val_only", False):
+                print(f"Validation only, val_save_path: {self.config.trainer.val_save_path}")
+                val_metrics = self._validate_with_save(self.config.trainer.val_save_path)
+            else:
+                val_metrics = self._validate()
+            assert val_metrics, f"{val_metrics=}"
+            pprint(f"Initial validation metrics: {val_metrics}")
+            logger.log(data=val_metrics, step=self.global_steps)
+            if self.config.trainer.get("val_only", False):
+                return
+
+        # add tqdm
+        progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
+
+        # we start from step 1
+        self.global_steps += 1
+        last_val_metrics = None
+
+        timing_raw = defaultdict(float)
+        batch = None
+        num_prompt_in_batch = 0
+        num_gen_batches = 0
+        for epoch in range(self.config.trainer.total_epochs):
+            for batch_dict in self.train_dataloader:
+                metrics = {}
+
+                batch: DataProto = DataProto.from_single_dict(batch_dict)
+                num_gen_batches += 1
+                # pop those keys for generation
+                if "multi_modal_data" in batch.non_tensor_batch.keys():
+                    gen_batch = batch.pop(
+                        batch_keys=["input_ids", "attention_mask", "position_ids"],
+                        non_tensor_batch_keys=["raw_prompt_ids", "multi_modal_data"],
+                    )
+                else:
+                    gen_batch = batch.pop(
+                        batch_keys=["input_ids", "attention_mask", "position_ids"],
+                        non_tensor_batch_keys=["raw_prompt_ids"],
+                    )
+
+                is_last_step = self.global_steps >= self.total_training_steps
+
+                with _timer("step", timing_raw):
+                    # generate a batch
+                    with _timer("gen", timing_raw):
+                        gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+
+                    if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
+                        with _timer("gen_max", timing_raw):
+                            gen_baseline_batch = deepcopy(gen_batch)
+                            gen_baseline_batch.meta_info["do_sample"] = False
+                            gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_batch)
+
+                            batch = batch.union(gen_baseline_output)
+                            reward_baseline_tensor = self.reward_fn(batch)
+                            reward_baseline_tensor = reward_baseline_tensor.sum(dim=-1)
+
+                            batch.pop(batch_keys=list(gen_baseline_output.batch.keys()))
+
+                            batch.batch["reward_baselines"] = reward_baseline_tensor
+
+                            del gen_baseline_batch, gen_baseline_output
+
+                    batch.non_tensor_batch["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object)
+                    # repeat to align with repeated responses in rollout
+                    batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                    batch = batch.union(gen_batch_output)
+
+                    with _timer("reward", timing_raw):
+                        # compute scores. Support both model and function-based.
+                        # We first compute the scores using reward model. Then, we call reward_fn to combine
+                        # the results from reward model and rule-based results.
+                        if self.use_rm:
+                            # we first compute reward model score
+                            reward_tensor = self.rm_wg.compute_rm_score(batch)
+                            batch = batch.union(reward_tensor)
+
+                        # we combine with rule-based rm
+                        reward_extra_infos_dict: dict[str, list] = {}
+                        try:
+                            reward_result = self.reward_fn(batch, return_dict=True)
+                            reward_tensor = reward_result["reward_tensor"]
+                            reward_extra_infos_dict = reward_result["reward_extra_info"]
+                        except Exception as e:
+                            print(f"Error in reward_fn: {e}")
+                            reward_tensor = self.reward_fn(batch)
+                            reward_extra_infos_dict = {}
+
+                        batch.batch["token_level_scores"] = reward_tensor
+                        batch.batch["confidence_tensor"] = torch.tensor(reward_extra_infos_dict["confidence"])
+                        batch.batch["format_tensor"] = torch.tensor(reward_extra_infos_dict["format"])
+                        batch.batch["acc_tensor"] = torch.tensor(reward_extra_infos_dict["acc"])
+                        batch.batch["brier_score"] =  1.0 * (batch.batch["acc_tensor"] - batch.batch["confidence_tensor"]) ** 2
+
+                        print(f"{list(reward_extra_infos_dict.keys())=}")
+                        if reward_extra_infos_dict:
+                            batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
+
+                        # Compute response_mask
+                        if "response_mask" not in batch.batch:
+                            batch.batch["response_mask"] = compute_response_mask(batch)
+
+                        # compute rewards. apply_kl_penalty if available
+                        if self.config.algorithm.use_kl_in_reward:
+                            batch, kl_metrics = apply_kl_penalty(batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty)
+                            metrics.update(kl_metrics)  # TODO: This will be cleared if we use multiple genenration batches
+                        else:
+                            batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+
+                    metrics.update({"format/valid_num": batch.batch['format_tensor'].sum().item()})
+                    metrics.update({"confidence_metrics/brier_score/mean": batch.batch['brier_score'].mean().item()})
+                    metrics.update({"confidence_metrics/brier_score/max": batch.batch['brier_score'].max().item()})
+                    metrics.update({"confidence_metrics/brier_score/min": batch.batch['brier_score'].min().item()})
+                    
+                    # Compute AUROC and ECE for training batch
+                    acc_tensor_np = batch.batch['acc_tensor'].cpu().numpy()
+                    confidence_tensor_np = batch.batch['confidence_tensor'].cpu().numpy()
+                    
+                    train_auroc = compute_auroc(acc_tensor_np, confidence_tensor_np)
+                    train_ece = compute_ece(acc_tensor_np, confidence_tensor_np, n_bins=10)
+                    
+                    metrics.update({"confidence_metrics/auroc": train_auroc})
+                    metrics.update({"confidence_metrics/ece": train_ece})
+
+                    batch.batch["confidence_reward"] = (1 - batch.batch["brier_score"]) + self.config.algorithm.get("format_reward_weight", 0.0) * batch.batch["format_tensor"]
+                    batch.batch["accuracy_reward"] = batch.batch["acc_tensor"] + self.config.algorithm.get("format_reward_weight", 0.0) * batch.batch["format_tensor"]
+                        
+                    # === Updating ===
+                    if "response_mask" not in batch.batch:
+                        batch.batch["response_mask"] = compute_response_mask(batch)
+
+                    # Balance the number of valid tokens across DP ranks.
+                    # NOTE: This usually changes the order of data in the `batch`,
+                    # which won't affect the advantage calculation (since it's based on uid),
+                    # but might affect the loss calculation (due to the change of mini-batching).
+                    # TODO: Decouple the DP balancing and mini-batching.
+                    if self.config.trainer.balance_batch:
+                        self._balance_batch(batch, metrics=metrics)
+
+                    # compute global_valid tokens
+                    batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
+
+                    # recompute old_log_probs
+                    with _timer("old_log_prob", timing_raw):
+                        old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+                        entropys = old_log_prob.batch["entropys"]
+                        response_masks = batch.batch["response_mask"]
+                        loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
+                        entropy_loss = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
+                        old_log_prob_metrics = {"actor/entropy_loss": entropy_loss.detach().item()}
+                        metrics.update(old_log_prob_metrics)
+                        old_log_prob.batch.pop("entropys")
+                        batch = batch.union(old_log_prob)
+
+                    if self.use_reference_policy:
+                        # compute reference log_prob
+                        with _timer("ref", timing_raw):
+                            ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
+                            batch = batch.union(ref_log_prob)
+
+                    # compute values
+                    if self.use_critic:
+                        with _timer("values", timing_raw):
+                            values = self.critic_wg.compute_values(batch)
+                            batch = batch.union(values)
+
+                    # split mask by answer tag
+                    accuracy_response_mask, confidence_response_mask = self.split_mask_by_answer_tag(batch.batch, self.tokenizer)
+
+                    batch.batch["accuracy_response_mask"] = accuracy_response_mask
+                    batch.batch["confidence_response_mask"] = confidence_response_mask
+
+                    # compute answer_tokens and confidence_tokens length
+                    answer_tokens_length = accuracy_response_mask.sum(dim=-1).float().mean().item()
+                    confidence_tokens_length = confidence_response_mask.sum(dim=-1).float().mean().item()
+                    
+                    # Add answer_tokens and confidence_tokens length statistics to metrics
+                    metrics.update({"tokens_length/answer_tokens/mean": answer_tokens_length})
+                    metrics.update({"tokens_length/confidence_tokens/mean": confidence_tokens_length})
+
+                    with _timer("adv", timing_raw):
+                        # compute advantages, executed on the driver process
+                        norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)
+                        group_confidence_adv_by_acc = self.config.algorithm.get("group_confidence_adv_by_acc", False)
+                        
+                        accuracy_advantages, confidence_advantages = compute_accuracy_and_confidence_advantage(
+                            batch,
+                            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                            group_by_acc=group_confidence_adv_by_acc,
+                        )
+
+                        confidence_weight = self.config.algorithm.get("confidence_weight", 1.0)
+
+                        if self.config.algorithm.get("weight_by_token_num", False):
+                            confidence_weight = confidence_weight * answer_tokens_length / confidence_tokens_length
+
+                        batch.batch["advantages"] = accuracy_advantages + confidence_weight * confidence_advantages
+                        batch.batch["returns"] = batch.batch["advantages"]
+
+                    # update critic
+                    if self.use_critic:
+                        with _timer("update_critic", timing_raw):
+                            critic_output = self.critic_wg.update_critic(batch)
+                        critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
+                        metrics.update(critic_output_metrics)
+
+                    # implement critic warmup
+                    if self.config.trainer.critic_warmup <= self.global_steps:
+                        # update actor
+                        with _timer("update_actor", timing_raw):
+                            actor_output = self.actor_rollout_wg.update_actor(batch)
+                        actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                        metrics.update(actor_output_metrics)
+
+                    # validate
+                    if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0):
+                        with _timer("testing", timing_raw):
+                            val_metrics: dict = self._validate()
+                            if is_last_step:
+                                last_val_metrics = val_metrics
+                        metrics.update(val_metrics)
+
+                    if self.config.trainer.save_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.save_freq == 0):
+                        with _timer("save_checkpoint", timing_raw):
+                            self._save_checkpoint()
+
+                # collect metrics
+                metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+                metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
+                # TODO: implement actual tflpo and theoretical tflpo
+                n_gpus = self.resource_pool_manager.get_n_gpus()
+                metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
+                timing_raw = defaultdict(float)  # clear timing
+
+                metrics["train/num_gen_batches"] = num_gen_batches
+                batch = None
+                num_prompt_in_batch = 0
+                num_gen_batches = 0
+
+                # TODO: make a canonical logger that supports various backend
+                logger.log(data=metrics, step=self.global_steps)
+
+                if is_last_step:
+                    pprint(f"Final validation metrics: {last_val_metrics}")
+                    progress_bar.close()
+                    return
+
+                progress_bar.update(1)
+                self.global_steps += 1
